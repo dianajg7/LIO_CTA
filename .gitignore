@@ -1,0 +1,52 @@
+# =========================
+# C++ & CMake Build Files
+# =========================
+build/
+build-*/
+CMakeCache.txt
+CMakeFiles/
+Makefile
+*.ninja
+.ninja_deps
+.ninja_log
+compile_commands.json
+
+# =========================
+# Compiled Binaries
+# =========================
+*.o
+*.so
+*.dylib
+*.dll
+*.a
+*.out
+*.app
+*.exe
+
+# =========================
+# Python & uv Virtual Env
+# =========================
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# =========================
+# IDE & OS Junk
+# =========================
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# =========================
+# LiDAR Data & Large Files
+# =========================
+data/
+*.pcd
+*.las
+*.laz
+*.bag
+*.ply
+*.bin
