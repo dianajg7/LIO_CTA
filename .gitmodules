@@ -4,3 +4,6 @@
 [submodule "third_party/PDAL"]
 	path = third_party/PDAL
 	url = https://github.com/PDAL/PDAL.git
+[submodule "third_party/ouster_sdk"]
+	path = third_party/ouster_sdk
+	url = https://github.com/ouster-lidar/ouster-sdk.git

@@ -8,6 +8,7 @@ find_package(OpenMP REQUIRED)
 
 add_subdirectory(third_party/Open3D EXCLUDE_FROM_ALL)
 add_subdirectory(third_party/PDAL EXCLUDE_FROM_ALL)
+add_subdirectory(third_party/ouster_sdk EXCLUDE_FROM_ALL)
 
 add_executable(CTA_LIO_Core
     src/main.cpp
@@ -17,6 +18,8 @@ target_link_libraries(CTA_LIO_Core PRIVATE
     OpenMP::OpenMP_CXX
     Open3D::Open3D
     pdalcpp
+    ouster::client
+    ouster::os_pcap
 )
 
 target_include_directories(CTA_LIO_Core PRIVATE
