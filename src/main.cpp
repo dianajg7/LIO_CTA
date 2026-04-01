@@ -10,6 +10,8 @@
 #include <filesystem>
 #include <cmath>
 #include <limits>
+#include <deque>
+#include <mutex>
 
 #include <pdal/PointTable.hpp>
 #include <pdal/PointView.hpp>
@@ -24,126 +26,394 @@
 #include <open3d/io/PointCloudIO.h>
 #include <open3d/geometry/KDTreeFlann.h>
 
+#include <cstring>         // <-- ADD THIS for std::memcpy
+#include <ouster/client.h>
+#include <ouster/lidar_scan.h>
+#include <ouster/types.h>
+#include <ouster/xyzlut.h>
+#include <ouster/os_pcap.h> // <-- RESTORE THIS
+#include <ouster/pcap.h>    // <-- KEEP THIS
 
-// ---------------------------------------------------------
-// Mock Trajectory Interpolator
-// ---------------------------------------------------------
+
+struct ImuMeasurement {
+    double timestamp; // In seconds
+    Eigen::Vector3d acceleration; // Linear acceleration (m/s^2)
+    Eigen::Vector3d angular_velocity; // Gyroscope (rad/s)
+};
+
 // class TrajectoryInterpolator {
+// private:
+//     std::deque<ImuMeasurement> imu_buffer_;
+//     mutable std::mutex buffer_mutex_; // <-- FIX 1: Add 'mutable' here
+
 // public:
+//     // <-- FIX 2: Add this missing method
+//     void addImuMeasurement(const ImuMeasurement& imu) {
+//         std::lock_guard<std::mutex> lock(buffer_mutex_);
+//         imu_buffer_.push_back(imu);
+//     }
+
+//     void clearOldData(double up_to_time) {
+//         std::lock_guard<std::mutex> lock(buffer_mutex_);
+//         while (!imu_buffer_.empty() && imu_buffer_.front().timestamp < up_to_time) {
+//             imu_buffer_.pop_front();
+//         }
+//     }
+
 //     Eigen::Matrix4d getPoseAtTime(double timestamp) const {
+//         std::lock_guard<std::mutex> lock(buffer_mutex_);
+//         // ... [Rest of your S-Curve math remains identical] ...
 //         Eigen::Matrix4d pose = Eigen::Matrix4d::Identity();
-//         pose(0, 3) = 10.0 * timestamp; 
+        
+//         double velocity_x = 10.0;
+//         double amplitude = 40.0;
+//         double frequency = 0.5;
+
+//         double x = velocity_x * timestamp;
+//         double y = amplitude * std::sin(frequency * timestamp);
+
+//         double dy_dt = amplitude * frequency * std::cos(frequency * timestamp);
+//         double dx_dt = velocity_x;
+//         double yaw = std::atan2(dy_dt, dx_dt);
+
+//         pose(0, 0) = std::cos(yaw);
+//         pose(0, 1) = -std::sin(yaw);
+//         pose(1, 0) = std::sin(yaw);
+//         pose(1, 1) = std::cos(yaw);
+
+//         pose(0, 3) = x;
+//         pose(1, 3) = y;
+//         pose(2, 3) = 0.0; 
+
 //         return pose;
 //     }
 // };
-// ---------------------------------------------------------
-// Mock Trajectory Interpolator (S-Curve)
-// ---------------------------------------------------------
+
+
+struct PoseState {
+    double timestamp;
+    Eigen::Vector3d position;
+    Eigen::Quaterniond orientation;
+    Eigen::Vector3d velocity;
+};
+
 class TrajectoryInterpolator {
+private:
+    std::deque<PoseState> pose_buffer_;
+    mutable std::mutex buffer_mutex_;
+    
+    bool is_initialized_ = false;
+    PoseState current_state_;
+    Eigen::Vector3d gravity_{0.0, 0.0, 9.80665}; // Standard gravity vector
+
+    // Helper to convert our state to a 4x4 Homogeneous Matrix
+    static Eigen::Matrix4d toMatrix(const PoseState& state) {
+        Eigen::Matrix4d m = Eigen::Matrix4d::Identity();
+        m.block<3,3>(0,0) = state.orientation.toRotationMatrix();
+        m.block<3,1>(0,3) = state.position;
+        return m;
+    }
+
 public:
-    Eigen::Matrix4d getPoseAtTime(double timestamp) const {
-        Eigen::Matrix4d pose = Eigen::Matrix4d::Identity();
-
-        // 1. Define the parameters of the S-curve
-        double velocity_x = 10.0;       // Forward speed (10 m/s)
-        double amplitude = 40.0;         // Lateral swerve width (5 meters)
-        double frequency = 0.5;         // Swerve frequency (rad/s)
-
-        // 2. Calculate the Translation (X, Y)
-        double x = velocity_x * timestamp;
-        double y = amplitude * std::sin(frequency * timestamp);
-
-        // 3. Calculate the Heading (Yaw) to face the direction of travel
-        double dy_dt = amplitude * frequency * std::cos(frequency * timestamp);
-        double dx_dt = velocity_x;
-        double yaw = std::atan2(dy_dt, dx_dt);
-
-        // 4. Construct the Rotation Matrix (Rotation around Z-axis)
-        pose(0, 0) = std::cos(yaw);
-        pose(0, 1) = -std::sin(yaw);
-        pose(1, 0) = std::sin(yaw);
-        pose(1, 1) = std::cos(yaw);
-
-        // 5. Apply the Translation
-        pose(0, 3) = x;
-        pose(1, 3) = y;
+    void addImuMeasurement(const ImuMeasurement& imu) {
+        std::lock_guard<std::mutex> lock(buffer_mutex_);
         
-        // Z remains 0.0 for a flat 2D ground test
-        pose(2, 3) = 0.0; 
+        if (!is_initialized_) {
+            current_state_.timestamp = imu.timestamp;
+            current_state_.position.setZero();
+            current_state_.orientation.setIdentity();
+            current_state_.velocity.setZero(); 
+            
+            pose_buffer_.push_back(current_state_);
+            is_initialized_ = true;
+            return;
+        }
+
+        double dt = imu.timestamp - current_state_.timestamp;
+        if (dt <= 0) return;
+
+        // 1. Update Orientation (Integrate Angular Velocity)
+        Eigen::Vector3d w = imu.angular_velocity;
+        Eigen::Quaterniond dq;
+        double w_norm = w.norm();
+        if (w_norm > 1e-5) {
+            dq = Eigen::Quaterniond(Eigen::AngleAxisd(w_norm * dt, w / w_norm));
+        } else {
+            dq = Eigen::Quaterniond::Identity();
+        }
+        Eigen::Quaterniond next_q = current_state_.orientation * dq;
+        next_q.normalize(); // Prevent floating point drift in the quaternion
+
+        // 2. Update Velocity & Position (Integrate Acceleration)
+        // Transform the local IMU acceleration into the global frame
+        Eigen::Vector3d a_global = current_state_.orientation * imu.acceleration;
+        
+        // Remove the Earth's gravity vector to find true linear acceleration
+        Eigen::Vector3d a_true = a_global - gravity_;
+
+        // Standard kinematics: p = p_0 + v_0*t + 0.5*a*t^2
+        Eigen::Vector3d next_p = current_state_.position + 
+                                 (current_state_.velocity * dt) + 
+                                 (0.5 * a_true * dt * dt);
+        
+        // v = v_0 + a*t
+        Eigen::Vector3d next_v = current_state_.velocity + (a_true * dt);
+
+        // 3. Save the new state
+        current_state_.timestamp = imu.timestamp;
+        current_state_.position = next_p;
+        current_state_.orientation = next_q;
+        current_state_.velocity = next_v;
+
+        pose_buffer_.push_back(current_state_);
+    }
+
+    void clearOldData(double up_to_time) {
+        std::lock_guard<std::mutex> lock(buffer_mutex_);
+        // Keep at least one element so we don't lose our state entirely
+        while (pose_buffer_.size() > 1 && pose_buffer_.front().timestamp < up_to_time) {
+            pose_buffer_.pop_front();
+        }
+    }
+
+    Eigen::Matrix4d getPoseAtTime(double timestamp) const {
+        std::lock_guard<std::mutex> lock(buffer_mutex_);
+        
+        if (pose_buffer_.empty()) return Eigen::Matrix4d::Identity();
+        
+        // If the requested time is outside our buffer, return the closest known edge
+        if (timestamp <= pose_buffer_.front().timestamp) return toMatrix(pose_buffer_.front());
+        if (timestamp >= pose_buffer_.back().timestamp) return toMatrix(pose_buffer_.back());
+
+        // Find the two poses that surround our requested timestamp
+        auto it_next = std::lower_bound(pose_buffer_.begin(), pose_buffer_.end(), timestamp,
+            [](const PoseState& a, double t) { return a.timestamp < t; });
+        
+        auto it_prev = std::prev(it_next);
+
+        // Calculate how far we are between the two poses (0.0 to 1.0)
+        double dt = it_next->timestamp - it_prev->timestamp;
+        double alpha = (timestamp - it_prev->timestamp) / dt;
+
+        // Linear interpolation for translation
+        Eigen::Vector3d interp_p = it_prev->position + alpha * (it_next->position - it_prev->position);
+        
+        // Spherical Linear Interpolation (SLERP) for rotation
+        Eigen::Quaterniond interp_q = it_prev->orientation.slerp(alpha, it_next->orientation);
+
+        // Construct and return the interpolated 4x4 matrix
+        Eigen::Matrix4d pose = Eigen::Matrix4d::Identity();
+        pose.block<3,3>(0,0) = interp_q.toRotationMatrix();
+        pose.block<3,1>(0,3) = interp_p;
 
         return pose;
     }
 };
 
 
-// bool exportToOBJ(const std::string& filename, 
-//                  const std::vector<std::vector<double>>& z_matrix,
-//                  double u_start, double u_inc, 
-//                  double v_start, double v_inc) 
-// {
-//     std::cout << "\n--- Exporting to OBJ 3D Mesh ---" << std::endl;
+bool parseOusterPcap(const std::string& pcap_file, 
+                     const std::string& json_meta_file,
+                     TrajectoryInterpolator& trajectory,
+                     std::shared_ptr<open3d::geometry::PointCloud>& global_cloud,
+                     std::vector<double>& point_times,
+                     int max_frames = 5) 
+{
+    std::cout << "\n--- Initializing Ouster PCAP Stream ---" << std::endl;
 
-//     if (z_matrix.empty() || z_matrix[0].empty()) {
-//         std::cerr << "Error: Z-matrix is empty." << std::endl;
-//         return false;
-//     }
+    auto info = ouster::sdk::core::metadata_from_json(json_meta_file);
+    auto pf = ouster::sdk::core::get_format(info); 
 
-//     std::ofstream obj_file(filename);
-//     if (!obj_file.is_open()) {
-//         std::cerr << "Error: Could not open " << filename << " for writing." << std::endl;
-//         return false;
-//     }
+    ouster::sdk::core::ScanBatcher batcher(info);
+    ouster::sdk::core::LidarScan scan(info);
 
-//     size_t num_u = z_matrix.size();
-//     size_t num_v = z_matrix[0].size();
+    // --- FIX 1: Generate the massive Lookup Table ONCE before the loop ---
+    std::cout << "Generating Cartesian Lookup Table (LUT)..." << std::endl;
+    auto lut = ouster::sdk::core::make_xyz_lut(info, false);
 
-//     std::vector<std::vector<size_t>> vertex_indices(num_u, std::vector<size_t>(num_v, 0));
-    
-//     size_t current_vertex_index = 1;
+    auto pcap = ouster::sdk::pcap::replay_initialize(pcap_file);
+    if (!pcap) {
+        std::cerr << "Error: Could not open PCAP file: " << pcap_file << std::endl;
+        return false;
+    }
 
-//     obj_file << "# Generated by CTA_LIO Pipeline\n";
-//     obj_file << "o Offroad_Terrain\n";
+    std::vector<uint8_t> packet_buf(65536);
+    int frame_count = 0;
+    int packet_count = 0;
+    double last_imu_time = 0.0;
 
-//     obj_file << std::fixed << std::setprecision(4);
-//     for (size_t u = 0; u < num_u; ++u) {
-//         for (size_t v = 0; v < num_v; ++v) {
-//             double z = z_matrix[u][v];
+    std::cout << "Successfully loaded PCAP and Metadata. Beginning stream..." << std::endl;
+
+    while (true) {
+        ouster::sdk::pcap::packet_info pi;
+        if (!ouster::sdk::pcap::next_packet_info(*pcap, pi)) break;
+        
+        size_t packet_size = ouster::sdk::pcap::read_packet(*pcap, packet_buf.data(), packet_buf.size());
+        if (packet_size == 0) break;
+
+        const uint8_t* raw_packet_data = packet_buf.data();
+        packet_count++;
+
+        if (packet_size == pf.imu_packet_size) {
+            ImuMeasurement imu;
+            imu.timestamp = pf.imu_sys_ts(raw_packet_data) / 1e9;
+            last_imu_time = imu.timestamp;
             
-//             if (!std::isnan(z)) {
-//                 double x = u_start + (u * u_inc);
-//                 double y = v_start + (v * v_inc);
+            constexpr double GRAVITY = 9.80665;
+            imu.acceleration = Eigen::Vector3d(
+                pf.imu_la_x(raw_packet_data) * GRAVITY,
+                pf.imu_la_y(raw_packet_data) * GRAVITY,
+                pf.imu_la_z(raw_packet_data) * GRAVITY
+            );
 
-//                 obj_file << "v " << x << " " << y << " " << z << "\n";
+            imu.angular_velocity = Eigen::Vector3d(
+                pf.imu_av_x(raw_packet_data) * M_PI / 180.0, 
+                pf.imu_av_y(raw_packet_data) * M_PI / 180.0,
+                pf.imu_av_z(raw_packet_data) * M_PI / 180.0
+            );
+
+            trajectory.addImuMeasurement(imu);
+        }
+        else if (packet_size == pf.lidar_packet_size) {
+            
+            ouster::sdk::core::LidarPacket lidar_packet(packet_size);
+            
+            // --- FIX 2: Force memory allocation before memcpy ---
+            if (lidar_packet.buf.size() < packet_size) {
+                lidar_packet.buf.resize(packet_size);
+            }
+            
+            std::memcpy(lidar_packet.buf.data(), raw_packet_data, packet_size);
+
+            if (batcher(lidar_packet, scan)) {
+                frame_count++;
+            
+                auto ouster_points = ouster::sdk::core::cartesian(scan, lut);
                 
-//                 vertex_indices[u][v] = current_vertex_index;
-//                 current_vertex_index++;
-//             }
-//         }
-//     }
+                double current_frame_time = last_imu_time;
 
-//     size_t face_count = 0;
-//     for (size_t u = 0; u < num_u - 1; ++u) {
-//         for (size_t v = 0; v < num_v - 1; ++v) {
-//             size_t top_left     = vertex_indices[u][v];
-//             size_t top_right    = vertex_indices[u][v+1];
-//             size_t bottom_left  = vertex_indices[u+1][v];
-//             size_t bottom_right = vertex_indices[u+1][v+1];
+                for (Eigen::Index i = 0; i < ouster_points.rows(); ++i) {
+                    double x = ouster_points(i, 0);
+                    double y = ouster_points(i, 1);
+                    double z = ouster_points(i, 2);
 
-//             if (top_left && top_right && bottom_left && bottom_right) {
-//                 obj_file << "f " << top_left << " " << bottom_left << " " << top_right << "\n";
-//                 obj_file << "f " << top_right << " " << bottom_left << " " << bottom_right << "\n";
-                
-//                 face_count += 2;
-//             }
-//         }
-//     }
+                    if (std::abs(x) < 1e-6 && std::abs(y) < 1e-6 && std::abs(z) < 1e-6) {
+                        continue; 
+                    }
 
-//     obj_file.close();
-//     std::cout << "Successfully exported " << current_vertex_index - 1 << " vertices and " 
-//               << face_count << " faces to " << filename << std::endl;
+                    global_cloud->points_.emplace_back(x, y, z);
+                    point_times.push_back(current_frame_time);
+                }
+
+                std::cout << "Extracted Frame " << frame_count << " (Total Points: " 
+                          << global_cloud->points_.size() << ")" << std::endl;
+
+                if (frame_count >= max_frames) {
+                    std::cout << "Reached max frame limit (" << max_frames << "). Stopping stream." << std::endl;
+                    break;
+                }
+            }
+        } 
+    }
     
-//     return true;
-// }
+    std::cout << "Stream finished. Processed " << packet_count << " total packets." << std::endl;
+
+    return true;
+}
+
+
+void parseOusterPcap(const std::string& pcap_file, 
+                     const std::string& json_meta_file,
+                     TrajectoryInterpolator& trajectory) 
+{
+    std::cout << "\n--- Initializing Ouster PCAP Stream ---" << std::endl;
+
+    auto info = ouster::sdk::core::metadata_from_json(json_meta_file);
+    auto pf = ouster::sdk::core::get_format(info); 
+
+    ouster::sdk::core::ScanBatcher batcher(info);
+    ouster::sdk::core::LidarScan scan(info);
+
+    auto pcap = ouster::sdk::pcap::replay_initialize(pcap_file);
+    if (!pcap) {
+        std::cerr << "Error: Could not open PCAP file: " << pcap_file << std::endl;
+        return;
+    }
+
+    std::cout << "Successfully loaded PCAP and Metadata. Beginning stream..." << std::endl;
+
+    // --- FIX 1: Allocate a buffer to hold the raw packet bytes ---
+    std::vector<uint8_t> packet_buf(65536);
+
+    while (true) {
+        ouster::sdk::pcap::packet_info pi;
+        
+        // --- FIX 2: Use the free function to check for the next packet ---
+        if (!ouster::sdk::pcap::next_packet_info(*pcap, pi)) {
+            break; // End of file
+        }
+        
+        // --- FIX 3: Use the free function to read the actual packet data ---
+        size_t packet_size = ouster::sdk::pcap::read_packet(*pcap, packet_buf.data(), packet_buf.size());
+        if (packet_size == 0) {
+            break;
+        }
+
+        const uint8_t* raw_packet_data = packet_buf.data();
+
+        if (packet_size == pf.imu_packet_size) {
+            ImuMeasurement imu;
+            imu.timestamp = pf.imu_sys_ts(raw_packet_data) / 1e9; 
+            
+            constexpr double GRAVITY = 9.80665;
+            imu.acceleration = Eigen::Vector3d(
+                pf.imu_la_x(raw_packet_data) * GRAVITY,
+                pf.imu_la_y(raw_packet_data) * GRAVITY,
+                pf.imu_la_z(raw_packet_data) * GRAVITY
+            );
+
+            imu.angular_velocity = Eigen::Vector3d(
+                pf.imu_av_x(raw_packet_data) * M_PI / 180.0, 
+                pf.imu_av_y(raw_packet_data) * M_PI / 180.0,
+                pf.imu_av_z(raw_packet_data) * M_PI / 180.0
+            );
+
+            trajectory.addImuMeasurement(imu);
+        }
+        else if (packet_size == pf.lidar_packet_size) {
+            
+            // --- FIX 4: Instantiate the derived LidarPacket class directly ---
+            ouster::sdk::core::LidarPacket lidar_packet(packet_size);
+            
+            std::memcpy(lidar_packet.buf.data(), raw_packet_data, packet_size);
+
+            if (batcher(lidar_packet, scan)) {
+                std::cout << "Completed full 360 LidarScan Frame. Extracting geometry..." << std::endl;
+                
+                auto lut = ouster::sdk::core::make_xyz_lut(info, false);
+                auto ouster_points = ouster::sdk::core::cartesian(scan, lut);
+                
+                auto raw_cloud = std::make_shared<open3d::geometry::PointCloud>();
+                raw_cloud->points_.reserve(ouster_points.rows());
+
+                for (Eigen::Index i = 0; i < ouster_points.rows(); ++i) {
+                    double x = ouster_points(i, 0);
+                    double y = ouster_points(i, 1);
+                    double z = ouster_points(i, 2);
+
+                    if (std::abs(x) < 1e-6 && std::abs(y) < 1e-6 && std::abs(z) < 1e-6) {
+                        continue; 
+                    }
+
+                    raw_cloud->points_.emplace_back(x, y, z);
+                }
+
+                std::cout << "Successfully mapped " << raw_cloud->points_.size() 
+                          << " valid LiDAR hits into Open3D." << std::endl;
+            }
+        } 
+    }
+}
+
 
 bool exportToOBJ(const std::string& filename, 
                  const std::vector<std::vector<Eigen::Vector3d>>& grid_3d) 
@@ -203,6 +473,7 @@ bool exportToOBJ(const std::string& filename,
 bool exportToOpenCRG_Curved(const std::string& filename, 
                             const std::vector<std::vector<Eigen::Vector3d>>& grid_3d,
                             const TrajectoryInterpolator& trajectory,
+                            double sweep_start_time,
                             double u_start, double u_inc, 
                             double v_start, double v_inc) 
 {
@@ -249,7 +520,8 @@ bool exportToOpenCRG_Curved(const std::string& filename,
     crg_file << "* Reference Line Heading (PHI)\n";
     crg_file << "$PHI " << num_u << "\n";
     for (size_t u = 0; u < num_u; ++u) {
-        double t = (u_start + u * u_inc) / 10.0;
+        // double t = (u_start + u * u_inc) / 10.0;
+        double t = sweep_start_time + ((u_start + u * u_inc) / 10.0);
         Eigen::Matrix4d pose = trajectory.getPoseAtTime(t);
         // Extract Yaw from the Rotation Matrix
         double yaw = std::atan2(pose(1, 0), pose(0, 0)); 
@@ -415,6 +687,7 @@ std::vector<std::vector<Eigen::Vector3d>> generateCurvilinearGridIDW(
     const std::vector<double>& grid_u, 
     const std::vector<double>& grid_v,
     const TrajectoryInterpolator& trajectory,
+    double sweep_start_time,
     double search_radius = 2.0) 
 {
     std::cout << "\n--- Generating Curvilinear Surface Grid (Spine-Aligned) ---" << std::endl;
@@ -445,7 +718,8 @@ std::vector<std::vector<Eigen::Vector3d>> generateCurvilinearGridIDW(
         for (size_t v = 0; v < num_v; ++v) {
             
             // 1. Calculate the time 't' for this longitudinal position 'U'
-            double t = grid_u[u] / velocity_x;
+            // double t = grid_u[u] / velocity_x;
+            double t = sweep_start_time + (grid_u[u] / velocity_x);
 
             // 2. Get the 6-DoF pose of the spine at this exact moment
             Eigen::Matrix4d T_spine = trajectory.getPoseAtTime(t);
@@ -730,8 +1004,6 @@ std::shared_ptr<open3d::geometry::PointCloud> deskewPointCloudParallel(
     if (raw_cloud->HasColors()) deskewed_cloud->colors_ = raw_cloud->colors_;
     if (raw_cloud->HasNormals()) deskewed_cloud->normals_ = raw_cloud->normals_;
 
-    // 2. Calculate the Base Frame Inverse
-    // This is the T_base^{-1} matrix. We transform all points to this specific instant in time.
     Eigen::Matrix4d T_base = trajectory.getPoseAtTime(sweep_start_time);
     Eigen::Matrix4d T_base_inv = T_base.inverse();
 
@@ -740,52 +1012,54 @@ std::shared_ptr<open3d::geometry::PointCloud> deskewPointCloudParallel(
 
     std::cout << "Starting parallel deskewing..." << std::endl;
 
-    // 3. The Parallel Execution Block
-    // This instructs the compiler to distribute the loop across all CPU threads
-    #pragma omp parallel for schedule(static)
-    for (size_t i = 0; i < num_points; ++i) {
-        
-        // A. Query the exact pose for this specific point's emission time
-        double t_p = point_times[i];
-        Eigen::Matrix4d T_point = trajectory.getPoseAtTime(t_p);
-        
-        // B. Calculate the relative transformation: T_rel = T_base^{-1} * T_point
-        Eigen::Matrix4d T_rel = T_base_inv * T_point;
-        
-        // C. Convert the raw 3D point to homogeneous coordinates (4D vector)
-        Eigen::Vector4d p_raw(
-            raw_cloud->points_[i](0), 
-            raw_cloud->points_[i](1), 
-            raw_cloud->points_[i](2), 
-            1.0
-        );
-        
-        // D. Apply the transformation to freeze the motion
-        Eigen::Vector4d p_deskewed = T_rel * p_raw;
-        
-        // E. Write the corrected coordinates directly into the pre-allocated array
-        deskewed_cloud->points_[i] = p_deskewed.head<3>();
+    // We open the parallel region early so we can create thread-local variables
+    #pragma omp parallel 
+    {
+        // This variable exists independently inside every thread!
+        size_t local_processed = 0; 
 
+        #pragma omp for schedule(static)
+        for (size_t i = 0; i < num_points; ++i) {
+            
+            double t_p = point_times[i];
+            Eigen::Matrix4d T_point = trajectory.getPoseAtTime(t_p);
+            Eigen::Matrix4d T_rel = T_base_inv * T_point;
+            
+            Eigen::Vector4d p_raw(
+                raw_cloud->points_[i](0), 
+                raw_cloud->points_[i](1), 
+                raw_cloud->points_[i](2), 
+                1.0
+            );
+            
+            Eigen::Vector4d p_deskewed = T_rel * p_raw;
+            deskewed_cloud->points_[i] = p_deskewed.head<3>();
 
-        // Thread-safe Progress Bar
-        size_t current_count = ++points_processed; // Atomically add 1
-        
-        // Only update the terminal every 1% to keep things fast
-        if (current_count % update_step == 0 || current_count == num_points) {
-            
-            int percentage = (current_count * 100) / num_points;
-            
-            // Force OpenMP threads to wait in line before talking to the terminal
-            #pragma omp critical 
-            {
-                // The '\r' tells the terminal to return to the start of the current line 
-                // instead of printing a new line every time!
-                std::cout << "\r[" << percentage << "%] Processed " 
-                          << current_count << " / " << num_points << " points" << std::flush;
+            // Increment the private counter (Zero contention)
+            local_processed++;
+
+            // Batch update the global atomic counter every 1000 points
+            if (local_processed == 1000) {
+                size_t current_count = (points_processed += local_processed);
+                local_processed = 0; // Reset local counter
+                
+                if (current_count % update_step < 1000) {
+                    int percentage = (current_count * 100) / num_points;
+                    
+                    #pragma omp critical 
+                    {
+                        std::cout << "\r[" << percentage << "%] Processed " 
+                                  << current_count << " / " << num_points << " points" << std::flush;
+                    }
+                }
             }
         }
+        
+        // Add any leftover points from this thread to the global counter
+        points_processed += local_processed;
     }
-    std::cout << std::endl;
+    
+    std::cout << "\nDeskewing Complete." << std::endl;
 
     return deskewed_cloud;
 }
@@ -793,26 +1067,54 @@ std::shared_ptr<open3d::geometry::PointCloud> deskewPointCloudParallel(
 int main() {
     std::cout << "=== CTA_LIO: Pipeline Execution Start ===" << std::endl;
 
+    // auto raw_cloud = std::make_shared<open3d::geometry::PointCloud>();
+    // auto cloth_cloud = std::make_shared<open3d::geometry::PointCloud>();
+
+    // std::string input_file = "../data/autzen.laz";
+    // std::string cache_file = "../data/autzen_ground.pcd";
+    // std::string crg_file   = "../data/autzen_surface.crg";
+    // std::string obj_file   = "../data/autzen_surface.obj";
+
+    // std::vector<double> point_times;
+
+    // if (!loadLiDARDataWithTime(input_file, raw_cloud, point_times)) {
+    //     return -1;
+    // }
+
+    // // NOTE: For mock data, pre-centering is okay. For real INS data, remove this
+    // // or offset the trajectory accordingly.
+    // Eigen::Vector3d center = raw_cloud->GetCenter();
+    // raw_cloud->Translate(-center);
+
+    // TrajectoryInterpolator trajectory;
+
+    //PCAP TEST START----------------------------
     auto raw_cloud = std::make_shared<open3d::geometry::PointCloud>();
     auto cloth_cloud = std::make_shared<open3d::geometry::PointCloud>();
 
-    std::string input_file = "../data/autzen.laz";
-    std::string cache_file = "../data/autzen_ground.pcd";
-    std::string crg_file   = "../data/autzen_surface.crg";
-    std::string obj_file   = "../data/autzen_surface.obj";
+    std::string pcap_file = "../data/test/ouster/Urban_Drive.pcap";
+    std::string json_file = "../data/test/ouster/Urban_Drive.json";
+    
+    std::string cache_file = "../data/test/ouster/Urban_Drive.pcd";
+    std::string crg_file   = "../data/test/ouster/Urban_Drive.crg";
+    std::string obj_file   = "../data/test/ouster/Urban_Drive.obj";
 
     std::vector<double> point_times;
+    TrajectoryInterpolator trajectory;
 
-    if (!loadLiDARDataWithTime(input_file, raw_cloud, point_times)) {
+    if (!std::filesystem::exists(pcap_file) || !std::filesystem::exists(json_file)) {
+        std::cerr << "CRITICAL ERROR: Could not find the .pcap or .json files !" << std::endl;
         return -1;
     }
 
-    // NOTE: For mock data, pre-centering is okay. For real INS data, remove this
-    // or offset the trajectory accordingly.
-    Eigen::Vector3d center = raw_cloud->GetCenter();
-    raw_cloud->Translate(-center);
+    if (!parseOusterPcap(pcap_file, json_file, trajectory, raw_cloud, point_times, 5)) {
+        return -1;
+    }
 
-    TrajectoryInterpolator trajectory;
+    // Eigen::Vector3d center = raw_cloud->GetCenter();
+    // raw_cloud->Translate(-center);
+    //PCAP TEST END---------------------------
+
     double sweep_start_time = point_times[0]; 
 
     std::cout << "Deskewing using " << omp_get_max_threads() << " CPU threads..." << std::endl;
@@ -869,26 +1171,96 @@ int main() {
         // std::vector<double> grid_u, grid_v;
         // for (double u = u_start; u <= u_end; u += u_inc) grid_u.push_back(u);
         // for (double v = v_start; v <= v_end; v += v_inc) grid_v.push_back(v);
-        double u_start = -200.0, u_inc = 0.25, u_end = 200.0;
-        double v_start = -10.0, v_inc = 0.25, v_end = 10.0;
+
+
+        // double u_start = -200.0, u_inc = 0.25, u_end = 200.0;
+        // double v_start = -10.0, v_inc = 0.25, v_end = 10.0;
+        // std::vector<double> grid_u, grid_v;
+        // for (double u = u_start; u <= u_end; u += u_inc) grid_u.push_back(u);
+        // for (double v = v_start; v <= v_end; v += v_inc) grid_v.push_back(v);
+        // //TEST SPINE LINE!!! END
+
+        // // auto z_matrix = generateSurfaceGridIDW(cloth_cloud, grid_u, grid_v, 3.0);
+        // auto grid_3d = generateCurvilinearGridIDW(cloth_cloud, grid_u, grid_v, trajectory, 3.0);
+
+        // if (!std::filesystem::exists(crg_file)) {
+        //     std::cout << "-- Generating OpenCRG" << std::endl;
+        //     exportToOpenCRG_Curved(crg_file, grid_3d, trajectory, u_start, u_inc, v_start, v_inc);
+        //     // exportToOpenCRG(crg_file, z_matrix, u_start, u_inc, v_start, v_inc);
+        // }
+        // if (!std::filesystem::exists(obj_file)) {
+        //     std::cout << "-- Generating OBJ" << std::endl;
+        //     exportToOBJ(obj_file, grid_3d);
+        //     // exportToOBJ(obj_file, z_matrix, u_start, u_inc, v_start, v_inc);
+        // }
+
+
+        // // --- FIX 6: Use the Dynamic Grid Size! ---
+        // Eigen::Vector3d min_bound = cloth_cloud->GetMinBound();
+        // Eigen::Vector3d max_bound = cloth_cloud->GetMaxBound();
+        
+        // // Give the grid a 1-meter padding around the actual ground points
+        // double buffer = 1.0; 
+        // double u_start = min_bound.x() - buffer;
+        // double u_end   = max_bound.x() + buffer;
+        // double v_start = min_bound.y() - buffer;
+        // double v_end   = max_bound.y() + buffer;
+        // double u_inc = 0.5; // Slightly coarser resolution for faster testing
+        // double v_inc = 0.5; 
+
+        // std::cout << "Dynamic Grid Size Detected:" << std::endl;
+        // std::cout << "  U Domain: [" << u_start << " to " << u_end << "] meters" << std::endl;
+        // std::cout << "  V Domain: [" << v_start << " to " << v_end << "] meters" << std::endl;
+
+        // std::vector<double> grid_u, grid_v;
+        // for (double u = u_start; u <= u_end; u += u_inc) grid_u.push_back(u);
+        // for (double v = v_start; v <= v_end; v += v_inc) grid_v.push_back(v);
+
+        // // Pass the new sweep_start_time parameter!
+        // auto grid_3d = generateCurvilinearGridIDW(cloth_cloud, grid_u, grid_v, trajectory, sweep_start_time, 3.0);
+
+        // if (!std::filesystem::exists(crg_file)) {
+        //     exportToOpenCRG_Curved(crg_file, grid_3d, trajectory, sweep_start_time, u_start, u_inc, v_start, v_inc);
+        // }
+        // if (!std::filesystem::exists(obj_file)) {
+        //     exportToOBJ(obj_file, grid_3d);
+        // }
+
+
+        // --- FIX 1: Calculate U based on Time, not Global X ---
+        // How much time passed between the first and last LiDAR point?
+        double duration = point_times.back() - point_times.front();
+        
+        // In generateCurvilinearGridIDW, your mock velocity is hardcoded to 10.0
+        double mock_velocity = 10.0; 
+
+        // U is Longitudinal (Forward) distance. 
+        double u_start = -2.0; // Give 2m padding behind the start
+        double u_end   = (duration * mock_velocity) + 2.0; // Distance = v*t (plus padding)
+        
+        // V is Lateral (Left/Right) distance from the car.
+        double v_start = -15.0; // 15 meters left
+        double v_end   =  15.0; // 15 meters right
+        
+        double u_inc = 0.5; 
+        double v_inc = 0.5; 
+
+        std::cout << "Curvilinear Grid Size Detected:" << std::endl;
+        std::cout << "  U Domain (Forward): [" << u_start << " to " << u_end << "] meters" << std::endl;
+        std::cout << "  V Domain (Lateral): [" << v_start << " to " << v_end << "] meters" << std::endl;
+
         std::vector<double> grid_u, grid_v;
         for (double u = u_start; u <= u_end; u += u_inc) grid_u.push_back(u);
         for (double v = v_start; v <= v_end; v += v_inc) grid_v.push_back(v);
-        //TEST SPINE LINE!!! END
 
-        // auto z_matrix = generateSurfaceGridIDW(cloth_cloud, grid_u, grid_v, 3.0);
-        auto grid_3d = generateCurvilinearGridIDW(cloth_cloud, grid_u, grid_v, trajectory, 3.0);
+        auto grid_3d = generateCurvilinearGridIDW(cloth_cloud, grid_u, grid_v, trajectory, sweep_start_time, 3.0);
 
-        if (!std::filesystem::exists(crg_file)) {
-            std::cout << "-- Generating OpenCRG" << std::endl;
-            exportToOpenCRG_Curved(crg_file, grid_3d, trajectory, u_start, u_inc, v_start, v_inc);
-            // exportToOpenCRG(crg_file, z_matrix, u_start, u_inc, v_start, v_inc);
-        }
-        if (!std::filesystem::exists(obj_file)) {
-            std::cout << "-- Generating OBJ" << std::endl;
-            exportToOBJ(obj_file, grid_3d);
-            // exportToOBJ(obj_file, z_matrix, u_start, u_inc, v_start, v_inc);
-        }
+        // --- FIX 2: Remove the std::filesystem::exists checks so we overwrite old data! ---
+        std::cout << "-- Generating OpenCRG" << std::endl;
+        exportToOpenCRG_Curved(crg_file, grid_3d, trajectory, sweep_start_time, u_start, u_inc, v_start, v_inc);
+        
+        std::cout << "-- Generating OBJ" << std::endl;
+        exportToOBJ(obj_file, grid_3d);
 
     } else {
         std::cerr << "-- Pipeline Error: No ground points available for CRG/OBJ generation." << std::endl;
@@ -922,3 +1294,4 @@ int main() {
 
     return 0;
 }
+

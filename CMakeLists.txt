@@ -6,7 +6,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(OpenMP REQUIRED)
 
+set(BUILD_WEBRTC OFF CACHE BOOL "" FORCE)
+set(BUILD_GUI OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/Open3D EXCLUDE_FROM_ALL)
+
 add_subdirectory(third_party/PDAL EXCLUDE_FROM_ALL)
 
 set(BUILD_VIZ OFF CACHE BOOL "" FORCE)
@@ -27,6 +30,7 @@ target_link_libraries(CTA_LIO_Core PRIVATE
     Open3D::Open3D
     pdalcpp
     ouster_client
+    ouster_sensor
     ouster_pcap
 )
 
