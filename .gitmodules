@@ -7,3 +7,9 @@
 [submodule "third_party/ouster_sdk"]
 	path = third_party/ouster_sdk
 	url = https://github.com/ouster-lidar/ouster-sdk.git
+[submodule "third_party/lgmath"]
+	path = third_party/lgmath
+	url = https://github.com/utiasASRL/lgmath.git
+[submodule "third_party/steam"]
+	path = third_party/steam
+	url = https://github.com/utiasASRL/steam.git
