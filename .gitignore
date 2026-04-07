@@ -43,10 +43,14 @@ Thumbs.db
 # =========================
 # LiDAR Data & Large Files
 # =========================
-data/
 *.pcd
 *.las
 *.laz
 *.bag
 *.ply
 *.bin
+*.pcap
+*.json
+*.trc
+*.crg
+*.obj 
