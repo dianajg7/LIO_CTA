@@ -1,8 +1,7 @@
-#include <open3d/Open3D.h>
-#include <Eigen/Dense>
 #include <vector>
 #include <memory>
 #include <iostream>
+#include <iomanip>
 #include <omp.h>
 #include <atomic>
 #include <chrono>
@@ -12,6 +11,13 @@
 #include <limits>
 #include <deque>
 #include <mutex>
+#include <string>
+#include <fstream>
+#include <sstream>
+#include <cstring>
+#include <cstdint>
+
+#include <Eigen/Dense>
 
 #include <pdal/PointTable.hpp>
 #include <pdal/PointView.hpp>
@@ -23,10 +29,10 @@
 #include <io/LasReader.hpp>
 #include <io/BufferReader.hpp>
 
+#include <open3d/Open3D.h>
 #include <open3d/io/PointCloudIO.h>
 #include <open3d/geometry/KDTreeFlann.h>
 
-#include <cstring> 
 #include <ouster/client.h>
 #include <ouster/lidar_scan.h>
 #include <ouster/types.h>
@@ -34,7 +40,6 @@
 #include <ouster/os_pcap.h> 
 #include <ouster/pcap.h>  
 
-// --- STEAM & lgmath Headers ---
 #include <lgmath/se3/Transformation.hpp>
 
 #include <steam/trajectory/const_vel/interface.hpp>
@@ -50,7 +55,7 @@ struct ImuMeasurement {
 };
 
 // ====================================================================
-// NEW: STEAM Continuous-Time Trajectory Interpolator
+// STEAM Continuous-Time Trajectory Interpolator
 // ====================================================================
 class TrajectoryInterpolator {
 private:
@@ -132,6 +137,18 @@ public:
         // Safety Catch: GP interpolation cannot extrapolate.
         // Clamp the query to the bounds of our trajectory knots.
         double clamped_time = std::max(first_time_, std::min(timestamp, last_time_));
+        
+        if (std::abs(timestamp - clamped_time) > 1e-3) {
+            static bool warned = false;
+            if (!warned) {
+                std::cerr << "\n[WARNING] LiDAR time (" << std::fixed << timestamp 
+                          << ") is outside INS trajectory bounds (" 
+                          << first_time_ << " to " << last_time_ << ")! "
+                          << "Adjust time_sync_offset.\n";
+                warned = true;
+            }
+        }
+
         steam::traj::Time query_time(clamped_time);
         
         // STEAM analytical GP evaluator
@@ -144,6 +161,177 @@ public:
     steam::traj::const_vel::Interface& getTrajectory() { return traj_; }
 };
 
+
+// ====================================================================
+// INS Parsing
+// ====================================================================
+struct InsNavState {
+    double timestamp = -1.0;
+    double heading = 0.0, pitch = 0.0, roll = 0.0;
+    double lat = 0.0, lon = 0.0, alt = 0.0;
+    double v_e = 0.0, v_n = 0.0, v_u = 0.0;
+    
+    bool has_ori = false, has_pos = false, has_vel = false;
+
+    bool isComplete() const { return has_ori && has_pos && has_vel; }
+    void reset() { has_ori = false; has_pos = false; has_vel = false; }
+};
+
+int64_t parse_48bit_signed(const std::vector<uint8_t>& payload) {
+    int64_t val = (static_cast<int64_t>(payload[0]) << 40) | (static_cast<int64_t>(payload[1]) << 32) |
+                  (static_cast<int64_t>(payload[2]) << 24) | (static_cast<int64_t>(payload[3]) << 16) |
+                  (static_cast<int64_t>(payload[4]) << 8)  |  static_cast<int64_t>(payload[5]);
+    if (val & 0x0000800000000000LL) val |= 0xFFFF000000000000LL;
+    return val;
+}
+
+int32_t parse_32bit_signed(const std::vector<uint8_t>& payload) {
+    return static_cast<int32_t>((payload[0] << 24) | (payload[1] << 16) | (payload[2] << 8) | payload[3]);
+}
+
+struct SyncBuffer {
+    double timestamp = -1.0;
+    
+    bool has_gyro = false;
+    Eigen::Vector3d gyro{0, 0, 0};
+    
+    bool has_accel = false;
+    Eigen::Vector3d accel{0, 0, 0};
+    
+    InsNavState nav;
+
+    void reset(double new_ts) {
+        timestamp = new_ts;
+        has_gyro = false;
+        has_accel = false;
+        nav.reset();
+        nav.timestamp = new_ts;
+    }
+};
+
+bool parseCanTrace(const std::string& trc_file, 
+                   TrajectoryInterpolator& trajectory,
+                   double time_sync_offset = 0.0) 
+{
+    std::cout << "\n--- Initializing Auto-Adapting CAN Parser ---" << std::endl;
+    
+    std::ifstream file(trc_file);
+    if (!file.is_open()) return false;
+
+    const double KG = 10.0;     // G2000 (2000 deg/sec)
+    const double KA = 500.0;    // A40 (40 g)
+    const double DEG_TO_RAD = M_PI / 180.0;
+    const double G_TO_MPS2  = 9.80665;
+
+    std::string line;
+    SyncBuffer buffer;
+    
+    int stats_full_imu = 0;
+    int stats_gyro_only = 0;
+    int stats_nav_states = 0;
+
+    auto processBuffer = [&]() {
+        if (buffer.timestamp < 0) return; 
+        
+        if (buffer.has_gyro) {
+            ImuMeasurement imu;
+            imu.timestamp = buffer.timestamp;
+            imu.angular_velocity = buffer.gyro;
+            
+            if (buffer.has_accel) {
+                // TIGHTLY-COUPLED strategy
+                imu.acceleration = buffer.accel;
+                trajectory.addImuMeasurement(imu);
+                stats_full_imu++;
+            } else {
+                // LOOSELY-COUPLED strategy
+                imu.acceleration = Eigen::Vector3d(0.0, 0.0, G_TO_MPS2); 
+                trajectory.addImuMeasurement(imu);
+                stats_gyro_only++;
+            }
+        }
+
+        if (buffer.nav.isComplete()) {
+            // LOOSELY-COUPLED: Add the INS-D solution as an absolute prior
+            // trajectory.addAbsolutePosePrior(buffer.nav); 
+            stats_nav_states++;
+        }
+    };
+
+    while (std::getline(file, line)) {
+        if (line.empty() || line.find(';') != std::string::npos) continue; 
+
+        std::istringstream iss(line);
+        std::vector<std::string> tokens;
+        std::string token;
+        while (iss >> token) tokens.push_back(token);
+
+        if (tokens.size() < 5) continue;
+
+        try {
+            double time_ms = std::stod(tokens[1]);
+            double current_timestamp = (time_ms / 1000.0) + time_sync_offset;
+
+            if (std::abs(current_timestamp - buffer.timestamp) > 0.005) {
+                processBuffer();
+                buffer.reset(current_timestamp);
+            }
+
+            uint32_t can_id = std::stoul(tokens[3], nullptr, 16);
+            int dlc = std::stoi(tokens[4]);
+
+            std::vector<uint8_t> p;
+            for (int i = 0; i < dlc && (5 + i) < tokens.size(); ++i) {
+                p.push_back(static_cast<uint8_t>(std::stoul(tokens[5 + i], nullptr, 16)));
+            }
+
+            uint32_t msg_offset = can_id & 0xF;
+
+            // Populate the buffer based on the message type
+            switch(msg_offset) {
+                case 0x0: { // Gyroscope
+                    int16_t x = static_cast<int16_t>((p[0] << 8) | p[1]);
+                    int16_t y = static_cast<int16_t>((p[2] << 8) | p[3]);
+                    int16_t z = static_cast<int16_t>((p[4] << 8) | p[5]);
+                    buffer.gyro = Eigen::Vector3d(x/KG, y/KG, z/KG) * DEG_TO_RAD;
+                    buffer.has_gyro = true;
+                    break;
+                }
+                case 0x1: { // Accelerometer
+                    int16_t x = static_cast<int16_t>((p[0] << 8) | p[1]);
+                    int16_t y = static_cast<int16_t>((p[2] << 8) | p[3]);
+                    int16_t z = static_cast<int16_t>((p[4] << 8) | p[5]);
+                    buffer.accel = Eigen::Vector3d(x/KA, y/KA, z/KA) * G_TO_MPS2;
+                    buffer.has_accel = true;
+                    break;
+                }
+                case 0x3: { // Orientation
+                    buffer.nav.heading = ((p[0] << 8) | p[1]) / 100.0 * DEG_TO_RAD;
+                    buffer.nav.pitch   = static_cast<int16_t>((p[2] << 8) | p[3]) / 100.0 * DEG_TO_RAD;
+                    buffer.nav.roll    = static_cast<int16_t>((p[4] << 8) | p[5]) / 100.0 * DEG_TO_RAD;
+                    buffer.nav.has_ori = true;
+                    break;
+                }
+                case 0x4: buffer.nav.v_e = parse_32bit_signed(p) / 100.0; break;
+                case 0x5: buffer.nav.v_n = parse_32bit_signed(p) / 100.0; buffer.nav.has_vel = true; break;
+                case 0x6: buffer.nav.v_u = parse_32bit_signed(p) / 100.0; break;
+                case 0x7: buffer.nav.lon = parse_48bit_signed(p) / 1e9; break;
+                case 0x8: buffer.nav.lat = parse_48bit_signed(p) / 1e9; buffer.nav.has_pos = true; break;
+                case 0x9: buffer.nav.alt = parse_32bit_signed(p) / 1000.0; break;
+            }
+
+        } catch (...) { continue; }
+    }
+    
+    processBuffer();
+
+    std::cout << "--- Parsing Complete ---" << std::endl;
+    std::cout << "Full IMU Pairs (Tightly-Coupled): " << stats_full_imu << std::endl;
+    std::cout << "Gyro-Only (Rotational Deskewing): " << stats_gyro_only << std::endl;
+    std::cout << "Nav States (Loosely-Coupled):     " << stats_nav_states << std::endl;
+
+    return true;
+}
 
 // ====================================================================
 // PIPELINE FUNCTIONS 
@@ -190,27 +378,8 @@ bool parseOusterPcap(const std::string& pcap_file,
         const uint8_t* raw_packet_data = packet_buf.data();
         packet_count++;
 
-        if (packet_size == pf.imu_packet_size) {
-            ImuMeasurement imu;
-            imu.timestamp = pf.imu_sys_ts(raw_packet_data) / 1e9;
-            last_imu_time = imu.timestamp;
-            
-            constexpr double GRAVITY = 9.80665;
-            imu.acceleration = Eigen::Vector3d(
-                pf.imu_la_x(raw_packet_data) * GRAVITY,
-                pf.imu_la_y(raw_packet_data) * GRAVITY,
-                pf.imu_la_z(raw_packet_data) * GRAVITY
-            );
-
-            imu.angular_velocity = Eigen::Vector3d(
-                pf.imu_av_x(raw_packet_data) * M_PI / 180.0, 
-                pf.imu_av_y(raw_packet_data) * M_PI / 180.0,
-                pf.imu_av_z(raw_packet_data) * M_PI / 180.0
-            );
-
-            trajectory.addImuMeasurement(imu);
-        }
-        else if (packet_size == pf.lidar_packet_size) {
+        // Ensure ONLY the LiDAR packets are processed
+        if (packet_size == pf.lidar_packet_size) {
             
             ouster::sdk::core::LidarPacket lidar_packet(packet_size);
             
@@ -224,7 +393,9 @@ bool parseOusterPcap(const std::string& pcap_file,
                 frame_count++;
             
                 auto ouster_points = ouster::sdk::core::cartesian(scan, lut);
-                double current_frame_time = last_imu_time;
+                
+                // Get the timestamp for this specific LiDAR sweep
+                double current_frame_time = pi.timestamp.count() / 1000000.0; // Adjust division based on PCAP
 
                 for (Eigen::Index i = 0; i < ouster_points.rows(); ++i) {
                     double x = ouster_points(i, 0);
@@ -249,7 +420,7 @@ bool parseOusterPcap(const std::string& pcap_file,
             }
         } 
     }
-    
+
     std::cout << "Stream finished. Processed " << packet_count << " total packets." << std::endl;
 
     return true;
@@ -612,24 +783,73 @@ std::shared_ptr<open3d::geometry::PointCloud> deskewPointCloudParallel(
     return deskewed_cloud;
 }
 
+// ====================================================================
+// TIME SYNCHRONIZATION
+// ====================================================================
+double getFirstCanTimestamp(const std::string& trc_file) {
+    std::ifstream file(trc_file);
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty() || line.find(';') != std::string::npos) continue;
+        std::istringstream iss(line);
+        std::string token;
+        iss >> token; // msg number
+        if (iss >> token) {
+            return std::stod(token) / 1000.0;
+        }
+    }
+    return 0.0;
+}
+
+double getFirstPcapTimestamp(const std::string& pcap_file) {
+    auto pcap = ouster::sdk::pcap::replay_initialize(pcap_file);
+    if (!pcap) return 0.0;
+    ouster::sdk::pcap::PacketInfo pi;
+    if (ouster::sdk::pcap::next_packet_info(*pcap, pi)) {
+        return pi.timestamp.count() / 1000000.0;
+    }
+    return 0.0;
+}
+
+// ====================================================================
+// MAIN
+// ====================================================================
 int main() {
     std::cout << "=== CTA_LIO: Pipeline Execution Start ===" << std::endl;
 
     auto raw_cloud = std::make_shared<open3d::geometry::PointCloud>();
     auto cloth_cloud = std::make_shared<open3d::geometry::PointCloud>();
 
-    std::string pcap_file = "../data/test/ouster/Urban_Drive.pcap";
-    std::string json_file = "../data/test/ouster/Urban_Drive.json";
+    std::string base_file_name = "../data/plaster_city/section_3/Section3Outof3ForwardAndBack1";
+
+    std::string pcap_file = base_file_name + ".pcap";
+    std::string json_file = base_file_name + ".json";
+    std::string trc_file  = base_file_name + ".trc";
     
-    std::string cache_file = "../data/test/ouster/Urban_Drive.pcd";
-    std::string crg_file   = "../data/test/ouster/Urban_Drive.crg";
-    std::string obj_file   = "../data/test/ouster/Urban_Drive.obj";
+    std::string cache_file = base_file_name + ".pcd";
+    std::string crg_file   = base_file_name + ".crg";
+    std::string obj_file   = base_file_name + ".obj";
 
     std::vector<double> point_times;
     TrajectoryInterpolator trajectory;
 
     if (!std::filesystem::exists(pcap_file) || !std::filesystem::exists(json_file)) {
         std::cerr << "CRITICAL ERROR: Could not find the .pcap or .json files !" << std::endl;
+        return -1;
+    }
+
+    // --- AUTOMATED TIME SYNCHRONIZATION ---
+    double first_pcap_time = getFirstPcapTimestamp(pcap_file);
+    double first_can_time  = getFirstCanTimestamp(trc_file);
+
+    double time_sync_offset = first_pcap_time - first_can_time;
+
+    std::cout << std::fixed << std::setprecision(6);
+    std::cout << "\n[Time Sync] First PCAP Time: " << first_pcap_time << " s\n";
+    std::cout << "[Time Sync] First CAN Time:  " << first_can_time << " s\n";
+    std::cout << "[Time Sync] Auto-Applied Offset: " << time_sync_offset << " s\n";
+
+    if (!parseCanTrace(trc_file, trajectory, time_sync_offset)) {
         return -1;
     }
 
