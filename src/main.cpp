@@ -422,7 +422,7 @@ bool parseOusterPcap(const std::string& pcap_file,
                 std::cout << "Extracted Frame " << frame_count << " (Total Points: " 
                           << global_cloud->points_.size() << ")" << std::endl;
 
-                if (frame_count >= max_frames) {
+                if (max_frames > 0 && frame_count >= max_frames) {
                     std::cout << "Reached max frame limit (" << max_frames << "). Stopping stream." << std::endl;
                     break;
                 }
@@ -853,6 +853,9 @@ double getFirstPcapTimestamp(const std::string& pcap_file) {
 // ====================================================================
 int main() {
     std::cout << "=== CTA_LIO: Pipeline Execution Start ===" << std::endl;
+    
+    // Start total pipeline timer
+    auto t_pipeline_start = std::chrono::high_resolution_clock::now();
 
     auto raw_cloud = std::make_shared<open3d::geometry::PointCloud>();
     auto cloth_cloud = std::make_shared<open3d::geometry::PointCloud>();
@@ -875,27 +878,11 @@ int main() {
         return -1;
     }
 
-    // --- AUTOMATED TIME SYNCHRONIZATION ---
-    // double first_pcap_time = getFirstPcapTimestamp(pcap_file);
-    // double first_can_time  = getFirstCanTimestamp(trc_file);
-
-    // double time_sync_offset = first_pcap_time - first_can_time;
-
-    // std::cout << std::fixed << std::setprecision(6);
-    // std::cout << "\n[Time Sync] First PCAP Time: " << first_pcap_time << " s\n";
-    // std::cout << "[Time Sync] First CAN Time:  " << first_can_time << " s\n";
-    // std::cout << "[Time Sync] Auto-Applied Offset: " << time_sync_offset << " s\n";
     // --- SEMI-AUTOMATED TIME SYNCHRONIZATION ---
     double first_pcap_time = getFirstPcapTimestamp(pcap_file);
     double first_can_time  = getFirstCanTimestamp(trc_file);
-
-    // Calculates the base epoch difference
     double base_offset = first_pcap_time - first_can_time;
-
-    // TWEAK THIS VARIABLE: Adjust by seconds (e.g., 1.5, -2.0) to manually 
-    // align the sensors based on your human click-delay when recording.
     double manual_human_delay = 0.0; 
-
     double time_sync_offset = base_offset + manual_human_delay;
 
     std::cout << std::fixed << std::setprecision(6);
@@ -903,41 +890,49 @@ int main() {
     std::cout << "[Time Sync] First CAN Time:  " << first_can_time << " s\n";
     std::cout << "[Time Sync] Applied Offset:  " << time_sync_offset << " s\n";
 
+    // --- STAGE 1: CAN PARSING ---
+    auto t_can_start = std::chrono::high_resolution_clock::now();
     if (!parseCanTrace(trc_file, trajectory, time_sync_offset)) {
         return -1;
     }
+    auto t_can_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration_can = t_can_end - t_can_start;
 
-    if (!parseOusterPcap(pcap_file, json_file, trajectory, raw_cloud, point_times, 500)) {
+    // --- STAGE 2: PCAP PARSING ---
+    auto t_pcap_start = std::chrono::high_resolution_clock::now();
+    if (!parseOusterPcap(pcap_file, json_file, trajectory, raw_cloud, point_times, 5000)) {
         return -1;
     }
+    auto t_pcap_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration_pcap = t_pcap_end - t_pcap_start;
 
-    double sweep_start_time = point_times[0]; 
-
+    // --- STAGE 3: DESKEWING ---
     std::cout << "Deskewing using " << omp_get_max_threads() << " CPU threads..." << std::endl;
+    auto t_deskew_start = std::chrono::high_resolution_clock::now();
+    
     auto deskewed_cloud = deskewPointCloudParallel(raw_cloud, point_times, trajectory);
-
-    // std::cout << "\n[Temporary] Cropping cloud for rapid testing..." << std::endl;
-    // Eigen::Vector3d min_bound(-300.0, -300.0, -1000.0); 
-    // Eigen::Vector3d max_bound( 300.0,  300.0,  1000.0);
     
-    // open3d::geometry::AxisAlignedBoundingBox bbox(min_bound, max_bound);
-    // auto cropped_cloud = deskewed_cloud->Crop(bbox);
-    
-    // std::cout << "Cropped from " << deskewed_cloud->points_.size() 
-    //           << " to " << cropped_cloud->points_.size() << " points." << std::endl;
+    auto t_deskew_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration_deskew = t_deskew_end - t_deskew_start;
 
+    // --- STAGE 4: GROUND EXTRACTION (CSF) ---
     std::cout << "Ground Extraction" << std::endl;
+    auto t_csf_start = std::chrono::high_resolution_clock::now();
     if (std::filesystem::exists(cache_file)) {
         std::cout << "-- Cache found! Loading ground points..." << std::endl;
         open3d::io::ReadPointCloud(cache_file, *cloth_cloud);
     } else {
         std::cout << "-- No cache found. Running Cloth Simulation Filter..." << std::endl;
-        cloth_cloud = extractBareEarthCSF(deskewed_cloud); //use cropped_cloud for debbug
+        cloth_cloud = extractBareEarthCSF(deskewed_cloud); 
         std::cout << "-- Saving ground points to cache..." << std::endl;
         open3d::io::WritePointCloud(cache_file, *cloth_cloud);
     }
+    auto t_csf_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration_csf = t_csf_end - t_csf_start;
 
+    // --- STAGE 5: SURFACE GENERATION ---
     std::cout << "Surface Generation" << std::endl;
+    auto t_surface_start = std::chrono::high_resolution_clock::now();
     if (cloth_cloud && !cloth_cloud->points_.empty()) {
         ArcLengthParameterization arc_param(trajectory, point_times.front(), point_times.back());
         double true_driven_distance = arc_param.getTotalLength();
@@ -970,6 +965,27 @@ int main() {
     } else {
         std::cerr << "-- Pipeline Error: No ground points available for CRG/OBJ generation." << std::endl;
     }
+    auto t_surface_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration_surface = t_surface_end - t_surface_start;
+    
+    auto t_pipeline_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration_total = t_pipeline_end - t_pipeline_start;
+
+    // ==========================================================
+    // EXECUTION TIME SUMMARY
+    // ==========================================================
+    std::cout << "\n=================================================" << std::endl;
+    std::cout << "             EXECUTION TIME SUMMARY              " << std::endl;
+    std::cout << "=================================================" << std::endl;
+    std::cout << std::fixed << std::setprecision(3);
+    std::cout << "1. CAN Trace Parsing:       " << duration_can.count() << " seconds" << std::endl;
+    std::cout << "2. PCAP Ouster Parsing:     " << duration_pcap.count() << " seconds" << std::endl;
+    std::cout << "3. Point Cloud Deskewing:   " << duration_deskew.count() << " seconds" << std::endl;
+    std::cout << "4. Ground Extraction (CSF): " << duration_csf.count() << " seconds" << std::endl;
+    std::cout << "5. Surface & Mesh Gen:      " << duration_surface.count() << " seconds" << std::endl;
+    std::cout << "-------------------------------------------------" << std::endl;
+    std::cout << "Total Data Processing Time: " << duration_total.count() << " seconds" << std::endl;
+    std::cout << "=================================================\n" << std::endl;
 
     std::cout << "Visualizing the OBJ Mesh and Point Cloud..." << std::endl;
     auto terrain_mesh = std::make_shared<open3d::geometry::TriangleMesh>();
@@ -983,12 +999,12 @@ int main() {
         cloth_cloud->PaintUniformColor({0.0, 1.0, 0.0});
         cloth_cloud->Translate(Eigen::Vector3d(0.0, 0.0, -1));
 
-        deskewed_cloud->PaintUniformColor({0.5, 0.5, 0.5}); //use cropped_cloud for debbug
+        deskewed_cloud->PaintUniformColor({0.5, 0.5, 0.5});
 
         std::cout << "Opening 3D Visualizer..." << std::endl;
         
         open3d::visualization::DrawGeometries(
-            {cloth_cloud, deskewed_cloud, terrain_mesh}, //use cropped_cloud for debbug
+            {cloth_cloud, deskewed_cloud, terrain_mesh},
             "OpenCRG Terrain Mesh with LiDAR Overlay"
         );
     } else {
