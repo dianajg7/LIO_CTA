@@ -13,3 +13,6 @@
 [submodule "third_party/steam"]
 	path = third_party/steam
 	url = https://github.com/utiasASRL/steam.git
+[submodule "third_party/geographiclib"]
+	path = third_party/geographiclib
+	url = https://github.com/geographiclib/geographiclib
