@@ -18,6 +18,8 @@
 #include <cstdint>
 
 #include <Eigen/Dense>
+#include <Eigen/Sparse>
+#include <Eigen/SparseCholesky>
 
 #include <pdal/PointTable.hpp>
 #include <pdal/PointView.hpp>
@@ -48,6 +50,8 @@
 #include <steam/problem/optimization_problem.hpp>
 #include <steam/solver/gauss_newton_solver.hpp>
 
+#include "RationalBezier.h"
+
 struct ImuMeasurement {
     double timestamp; // In seconds
     Eigen::Vector3d acceleration; // Linear acceleration (m/s^2)
@@ -67,7 +71,7 @@ struct InsNavState {
 };
 
 // ====================================================================
-// STEAM Continuous-Time Trajectory Interpolator
+// STEAM Continuous-Time Trajectory Interpolator (Refactored)
 // ====================================================================
 class TrajectoryInterpolator {
 private:
@@ -80,7 +84,8 @@ private:
     bool first_nav_ = true;
     double lat0_ = 0.0, lon0_ = 0.0, alt0_ = 0.0;
 
-    mutable std::mutex buffer_mutex_;
+    // Mutex renamed to clarify it is ONLY for writing/building the trajectory.
+    mutable std::mutex write_mutex_;
 
 public:
     TrajectoryInterpolator() {
@@ -91,10 +96,10 @@ public:
     }
 
     void addNavState(const InsNavState& nav) {
-        std::lock_guard<std::mutex> lock(buffer_mutex_);
+        // Lock only when ADDING data to prevent data corruption during parsing
+        std::lock_guard<std::mutex> lock(write_mutex_);
         if (!nav.isComplete()) return;
 
-        // Set the Local Tangent Plane origin on the first pose
         if (first_nav_) {
             lat0_ = nav.lat; 
             lon0_ = nav.lon; 
@@ -102,39 +107,32 @@ public:
             first_nav_ = false;
         }
 
-        // 1. Convert Lat/Lon/Alt to Local X/Y/Z (Meters)
-        const double R_EARTH = 6378137.0; // WGS84 Equatorial Radius
+        const double R_EARTH = 6378137.0; 
         double lat_rad = nav.lat * M_PI / 180.0;
         double lat0_rad = lat0_ * M_PI / 180.0;
         double d_lon_rad = (nav.lon - lon0_) * M_PI / 180.0;
         double d_lat_rad = (nav.lat - lat0_) * M_PI / 180.0;
 
-        double x = R_EARTH * std::cos(lat0_rad) * d_lon_rad; // Easting
-        double y = R_EARTH * d_lat_rad;                      // Northing
-        double z = nav.alt - alt0_;                          // Altitude
+        double x = R_EARTH * std::cos(lat0_rad) * d_lon_rad; 
+        double y = R_EARTH * d_lat_rad;                      
+        double z = nav.alt - alt0_;                          
 
-        // 2. Convert Heading/Pitch/Roll to Rotation Matrix
-        // ENU Mapping: X=East, Y=North. Heading is CW from North. 
-        // We must rotate the vehicle's X-axis (Forward) to align correctly.
         double yaw_rad = (M_PI / 2.0) - nav.heading; 
         Eigen::AngleAxisd yawAngle(yaw_rad, Eigen::Vector3d::UnitZ()); 
         Eigen::AngleAxisd pitchAngle(nav.pitch, Eigen::Vector3d::UnitY());
         Eigen::AngleAxisd rollAngle(nav.roll, Eigen::Vector3d::UnitX());
         Eigen::Matrix3d R = (yawAngle * pitchAngle * rollAngle).matrix();
 
-        // 3. Build the SE(3) Transformation
         Eigen::Matrix4d T_matrix = Eigen::Matrix4d::Identity();
         T_matrix.block<3,3>(0,0) = R;
         T_matrix.block<3,1>(0,3) = Eigen::Vector3d(x, y, z);
         lgmath::se3::Transformation T_pose(T_matrix);
 
-        // 4. Convert Velocity to Body Frame
         Eigen::Vector3d v_global(nav.v_e, nav.v_n, nav.v_u); 
         Eigen::Matrix<double, 6, 1> velocity;
         velocity.setZero();
         velocity.head<3>() = R.transpose() * v_global;
 
-        // 5. Add Knot to STEAM Trajectory
         steam::traj::Time knot_time(nav.timestamp);
         auto pose_var = steam::se3::SE3StateVar::MakeShared(T_pose);
         auto vel_var = steam::vspace::VSpaceStateVar<6>::MakeShared(velocity);
@@ -148,22 +146,15 @@ public:
         last_time_ = nav.timestamp;
     }
 
+    // REMOVED std::lock_guard from here. This allows thousands of 
+    // OpenMP threads to query the trajectory matrix simultaneously.
     Eigen::Matrix4d getPoseAtTime(double timestamp) const {
-        std::lock_guard<std::mutex> lock(buffer_mutex_);
         if (!is_initialized_) return Eigen::Matrix4d::Identity();
 
+        // Clamp time silently. Removed the static warning console output 
+        // to prevent race conditions and console spam during parallel execution.
         double clamped_time = std::max(first_time_, std::min(timestamp, last_time_));
         
-        if (std::abs(timestamp - clamped_time) > 1e-3) {
-            static bool warned = false;
-            if (!warned) {
-                std::cerr << "\n[WARNING] LiDAR time (" << std::fixed << timestamp 
-                          << ") is outside INS trajectory bounds (" 
-                          << first_time_ << " to " << last_time_ << ")!\n";
-                warned = true;
-            }
-        }
-
         steam::traj::Time query_time(clamped_time);
         auto pose_evaluator = traj_.getPoseInterpolator(query_time);
         return pose_evaluator->value().matrix();
@@ -171,6 +162,7 @@ public:
     
     steam::traj::const_vel::Interface& getTrajectory() { return traj_; }
 };
+
 
 // ====================================================================
 // INS Parsing
@@ -366,6 +358,15 @@ bool parseOusterPcap(const std::string& pcap_file,
     double last_imu_time = 0.0;
 
     std::cout << "Successfully loaded PCAP and Metadata. Beginning stream..." << std::endl;
+
+    // Calculate expected points: Width * Height * Frames
+    // Fallback to a safe estimate if max_frames is 0 (infinite)
+    size_t estimated_frames = (max_frames > 0) ? max_frames : 1000;
+    size_t estimated_points = scan.w * scan.h * estimated_frames;
+    
+    std::cout << "Reserving memory for approx. " << estimated_points << " points..." << std::endl;
+    global_cloud->points_.reserve(estimated_points);
+    point_times.reserve(estimated_points);
 
     while (true) {
         ouster::sdk::pcap::PacketInfo pi;
@@ -712,7 +713,7 @@ std::shared_ptr<open3d::geometry::PointCloud> extractBareEarthCSF(
 
     pdal::Options csf_opts;
     csf_opts.add("resolution", 0.5); 
-    csf_opts.add("rigidness", 3); 
+    csf_opts.add("rigidness", 4); 
     csf_opts.add("step", 0.65);
     csf_opts.add("threshold", 0.15); 
 
@@ -765,59 +766,44 @@ std::shared_ptr<open3d::geometry::PointCloud> extractBareEarthCSF(
     return cloth_cloud;
 }
 
-std::shared_ptr<open3d::geometry::PointCloud> deskewPointCloudParallel(
-    const std::shared_ptr<open3d::geometry::PointCloud>& raw_cloud,
+// ====================================================================
+// True Parallel Point Cloud Deskewing
+// ====================================================================
+// Changes from returning a new cloud to modifying the existing one
+void deskewPointCloudParallel(
+    std::shared_ptr<open3d::geometry::PointCloud>& cloud,
     const std::vector<double>& point_times,
     const TrajectoryInterpolator& trajectory)
 {
-    auto deskewed_cloud = std::make_shared<open3d::geometry::PointCloud>();
-    size_t num_points = raw_cloud->points_.size();
-    
-    deskewed_cloud->points_.resize(num_points);
-    if (raw_cloud->HasColors()) deskewed_cloud->colors_ = raw_cloud->colors_;
-    if (raw_cloud->HasNormals()) deskewed_cloud->normals_ = raw_cloud->normals_;
-
+    size_t num_points = cloud->points_.size();
     std::atomic<size_t> points_processed(0);
     size_t update_step = std::max<size_t>(1, num_points / 100); 
 
-    std::cout << "Starting parallel deskewing (Global Frame)..." << std::endl;
+    std::cout << "Starting lock-free IN-PLACE parallel deskewing..." << std::endl;
 
-    #pragma omp parallel 
-    {
-        size_t local_processed = 0; 
-        #pragma omp for schedule(static)
-        for (size_t i = 0; i < num_points; ++i) {
-            
-            double t_p = point_times[i];
-            Eigen::Matrix4d T_point = trajectory.getPoseAtTime(t_p);
-            
-            Eigen::Vector4d p_raw(
-                raw_cloud->points_[i](0), 
-                raw_cloud->points_[i](1), 
-                raw_cloud->points_[i](2), 
-                1.0
-            );
-            
-            // Transform directly into the Global ENU World!
-            Eigen::Vector4d p_deskewed = T_point * p_raw;
-            deskewed_cloud->points_[i] = p_deskewed.head<3>();
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < num_points; ++i) {
+        double t_p = point_times[i];
+        Eigen::Matrix4d T_point = trajectory.getPoseAtTime(t_p);
+        
+        Eigen::Vector4d p_raw(
+            cloud->points_[i](0), 
+            cloud->points_[i](1), 
+            cloud->points_[i](2), 
+            1.0
+        );
+        
+        // Overwrite the original point directly!
+        cloud->points_[i] = (T_point * p_raw).head<3>();
 
-            // ... (Keep your progress bar logic exactly the same) ...
-            local_processed++;
-            if (local_processed == 1000) {
-                size_t current_count = (points_processed += local_processed);
-                local_processed = 0; 
-                if (current_count % update_step < 1000) {
-                    int percentage = (current_count * 100) / num_points;
-                    #pragma omp critical 
-                    std::cout << "\r[" << percentage << "%] Processed " << current_count << " / " << num_points << " points" << std::flush;
-                }
-            }
+        size_t current_processed = ++points_processed;
+        if (current_processed % update_step == 0) {
+            int percentage = (current_processed * 100) / num_points;
+            #pragma omp critical 
+            std::cout << "\r[" << percentage << "%] Processed " << current_processed << " / " << num_points << " points" << std::flush;
         }
-        points_processed += local_processed;
     }
-    std::cout << "\nDeskewing Complete." << std::endl;
-    return deskewed_cloud;
+    std::cout << "\nIn-Place Deskewing Complete." << std::endl;
 }
 
 // ====================================================================
@@ -846,6 +832,393 @@ double getFirstPcapTimestamp(const std::string& pcap_file) {
         return pi.timestamp.count() / 1000000.0;
     }
     return 0.0;
+}
+
+
+// ====================================================================
+// CARTESIAN TO CURVILINEAR MAPPING
+// ====================================================================
+
+struct PointUVZ {
+    double u; // Forward distance along the trajectory (meters)
+    double v; // Lateral distance from the spine (meters)
+    double z; // True physical elevation (meters)
+};
+
+struct TrajectoryNode {
+    double u_base;          // Arc length at this node
+    Eigen::Matrix4d pose;   // SE(3) pose of the vehicle at this node
+};
+
+std::vector<PointUVZ> mapToCurvilinearSpace(
+    const std::shared_ptr<open3d::geometry::PointCloud>& ground_cloud,
+    const TrajectoryInterpolator& trajectory,
+    const ArcLengthParameterization& arc_param,
+    double max_lateral_distance = 12.0) // Clip points too far off the road
+{
+    std::cout << "\n--- Mapping Point Cloud to Curvilinear (u,v) Space ---" << std::endl;
+
+    // 1. Discretize the trajectory into a dense KD-Tree (every 0.25 meters)
+    double total_length = arc_param.getTotalLength();
+    double step_size = 0.25; 
+    
+    std::vector<TrajectoryNode> traj_nodes;
+    auto spine_cloud = std::make_shared<open3d::geometry::PointCloud>();
+
+    for (double u = 0; u <= total_length; u += step_size) {
+        double t = arc_param.getTimeAtArcLength(u);
+        Eigen::Matrix4d T_pose = trajectory.getPoseAtTime(t);
+        
+        traj_nodes.push_back({u, T_pose});
+        spine_cloud->points_.push_back(T_pose.block<3,1>(0,3));
+    }
+
+    open3d::geometry::KDTreeFlann kdtree;
+    kdtree.SetGeometry(*spine_cloud);
+
+    size_t num_points = ground_cloud->points_.size();
+    
+    // Using a thread-safe deque or pre-allocated vector to store results
+    // We pre-allocate to max size and count valid points to avoid vector resizing locks
+    std::vector<PointUVZ> uvz_points(num_points);
+    std::atomic<size_t> valid_count(0);
+    
+    std::cout << "Projecting " << num_points << " points onto trajectory spine..." << std::endl;
+
+    // 2. Parallel mapping
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < num_points; ++i) {
+        Eigen::Vector3d p_global = ground_cloud->points_[i];
+
+        // Find the nearest trajectory node
+        std::vector<int> indices(1);
+        std::vector<double> distances_sq(1);
+        if (kdtree.SearchKNN(p_global, 1, indices, distances_sq) == 0) continue;
+
+        int node_idx = indices[0];
+        const TrajectoryNode& node = traj_nodes[node_idx];
+
+        // Convert the global point to the local frame of the trajectory node
+        // P_local = R^T * (P_global - t)
+        Eigen::Vector3d t_node = node.pose.block<3,1>(0,3);
+        Eigen::Matrix3d R_node = node.pose.block<3,3>(0,0);
+        
+        Eigen::Vector3d p_local = R_node.transpose() * (p_global - t_node);
+
+        // p_local.x() is forward distance from the node (delta u)
+        // p_local.y() is lateral distance from the spine (v)
+        double u_exact = node.u_base + p_local.x();
+        double v_exact = p_local.y();
+
+        // Filter out points that are too far laterally (e.g., > 12m away)
+        // or points that project "backwards" past the start or end of the track
+        if (std::abs(v_exact) <= max_lateral_distance && u_exact >= 0.0 && u_exact <= total_length) {
+            
+            size_t insert_idx = valid_count++;
+            
+            uvz_points[insert_idx].u = u_exact;
+            uvz_points[insert_idx].v = v_exact;
+            uvz_points[insert_idx].z = p_global.z(); // Keep true physical elevation
+        }
+    }
+
+    // 3. Trim the vector down to only the valid points
+    uvz_points.resize(valid_count);
+    
+    std::cout << "Successfully mapped " << valid_count << " points to (u,v) bounds." << std::endl;
+    return uvz_points;
+}
+
+// ====================================================================
+// B-SPLINE GLOBAL FITTER
+// ====================================================================
+
+class BSplineSurfaceFitter {
+public:
+    static constexpr int DEGREE = 3; 
+
+    // The uniform 1D Bezier Extraction Operator for cubic B-Splines
+    const Eigen::Matrix4d C_uniform = (Eigen::Matrix4d() << 
+        1.0,     0.0,       0.0,       0.0,
+        0.5,     0.5,       0.0,       0.0,
+        0.25,    7.0/12.0,  1.0/6.0,   0.0,
+        1.0/6.0, 2.0/3.0,   1.0/6.0,   0.0
+    ).finished();
+
+    struct GridConfig {
+        double u_min, u_max;
+        double v_min, v_max;
+        double element_size_u;
+        double element_size_v;
+        int num_elements_u;
+        int num_elements_v;
+        int num_cpts_u;
+        int num_cpts_v;
+    };
+
+    GridConfig config;
+    Eigen::VectorXd global_control_points_z;
+
+    BSplineSurfaceFitter(double u_min, double u_max, double v_min, double v_max, 
+                         double element_u_len = 5.0, double element_v_len = 1.0) 
+    {
+        config.u_min = u_min;
+        config.u_max = u_max;
+        config.v_min = v_min;
+        config.v_max = v_max;
+        config.element_size_u = element_u_len;
+        config.element_size_v = element_v_len;
+
+        config.num_elements_u = std::ceil((u_max - u_min) / element_u_len);
+        config.num_elements_v = std::ceil((v_max - v_min) / element_v_len);
+
+        config.num_cpts_u = config.num_elements_u + DEGREE;
+        config.num_cpts_v = config.num_elements_v + DEGREE;
+    }
+
+    bool fitSurface(const std::vector<PointUVZ>& cloud) {
+        int num_pts = cloud.size();
+        int total_cpts = config.num_cpts_u * config.num_cpts_v;
+
+        std::cout << "\n--- Executing Global B-Spline Fit ---" << std::endl;
+        std::cout << "Grid Elements: " << config.num_elements_u << " x " << config.num_elements_v << std::endl;
+        std::cout << "Total Unknown Control Points: " << total_cpts << std::endl;
+
+        std::vector<Eigen::Triplet<double>> triplets;
+        triplets.reserve(num_pts * 16); 
+        Eigen::VectorXd Z(num_pts);
+
+        Bezier::BernsteinBasisCache<2, DEGREE> basis_cache;
+
+        std::cout << "Assembling observation matrix from " << num_pts << " points..." << std::endl;
+        for (int k = 0; k < num_pts; ++k) {
+            const auto& pt = cloud[k];
+            Z(k) = pt.z;
+
+            double u_norm = (pt.u - config.u_min) / config.element_size_u;
+            double v_norm = (pt.v - config.v_min) / config.element_size_v;
+
+            int elem_u = std::clamp(static_cast<int>(std::floor(u_norm)), 0, config.num_elements_u - 1);
+            int elem_v = std::clamp(static_cast<int>(std::floor(v_norm)), 0, config.num_elements_v - 1);
+
+            double xi  = u_norm - elem_u;
+            double eta = v_norm - elem_v;
+
+            basis_cache.compute(xi, eta);
+            auto arr_xi = basis_cache.getNXi();
+            auto arr_eta = basis_cache.getNEta();
+
+            Eigen::Vector4d B_xi(arr_xi[0], arr_xi[1], arr_xi[2], arr_xi[3]);
+            Eigen::Vector4d B_eta(arr_eta[0], arr_eta[1], arr_eta[2], arr_eta[3]);
+
+            Eigen::RowVector4d N_u_global = B_xi.transpose() * C_uniform;
+            Eigen::RowVector4d N_v_global = B_eta.transpose() * C_uniform;
+
+            for (int i = 0; i <= DEGREE; ++i) {
+                for (int j = 0; j <= DEGREE; ++j) {
+                    int global_u_idx = elem_u + i;
+                    int global_v_idx = elem_v + j;
+                    int flattened_cpt_idx = global_u_idx * config.num_cpts_v + global_v_idx;
+
+                    double weight = N_u_global(i) * N_v_global(j);
+                    triplets.push_back(Eigen::Triplet<double>(k, flattened_cpt_idx, weight));
+                }
+            }
+        }
+
+        Eigen::SparseMatrix<double> A(num_pts, total_cpts);
+        A.setFromTriplets(triplets.begin(), triplets.end());
+
+        std::cout << "Solving Sparse Normal Equations via SimplicialLDLT..." << std::endl;
+        Eigen::SparseMatrix<double> AtA = A.transpose() * A;
+        Eigen::VectorXd AtZ = A.transpose() * Z;
+
+        Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
+        solver.compute(AtA);
+        
+        if (solver.info() != Eigen::Success) {
+            std::cerr << "Decomposition failed! Grid may be under-sampled." << std::endl;
+            return false;
+        }
+
+        global_control_points_z = solver.solve(AtZ);
+        
+        if (solver.info() != Eigen::Success) {
+            std::cerr << "Solving failed!" << std::endl;
+            return false;
+        }
+
+        std::cout << "Engineering-grade B-Spline surface solved!" << std::endl;
+        return true;
+    }
+
+    // Extracts the 16 local Z heights for a given element, correctly formatted for your Bezier evaluator
+    std::vector<float> extractLocalWeights(int elem_u, int elem_v) const {
+        Eigen::Matrix4d P_global_4x4;
+        for (int i = 0; i <= DEGREE; ++i) {
+            for (int j = 0; j <= DEGREE; ++j) {
+                int global_u_idx = elem_u + i;
+                int global_v_idx = elem_v + j;
+                P_global_4x4(i, j) = global_control_points_z(global_u_idx * config.num_cpts_v + global_v_idx);
+            }
+        }
+
+        Eigen::Matrix4d P_local_4x4 = C_uniform.transpose() * P_global_4x4 * C_uniform;
+
+        std::vector<float> local_weights(16);
+        int idx = 0;
+        for (int j = 0; j <= DEGREE; ++j) {
+            for (int i = 0; i <= DEGREE; ++i) {
+                local_weights[idx++] = static_cast<float>(P_local_4x4(i, j));
+            }
+        }
+        return local_weights;
+    }
+};
+
+// ====================================================================
+// OPENCRG EXPORTER (BEZIER INTEGRATION)
+// ====================================================================
+bool exportToOpenCRG_Bezier(const std::string& filename, 
+                            const BSplineSurfaceFitter& fitter,
+                            const TrajectoryInterpolator& trajectory,
+                            const ArcLengthParameterization& arc_param,
+                            double u_inc = 0.1, double v_inc = 0.1) 
+{
+    std::cout << "\n--- Exporting B-Spline Surface to OpenCRG ---" << std::endl;
+    std::ofstream crg_file(filename);
+    if (!crg_file.is_open()) return false;
+
+    double u_start = fitter.config.u_min;
+    double u_end   = fitter.config.u_max;
+    double v_start = fitter.config.v_min;
+    double v_end   = fitter.config.v_max;
+
+    int num_u = std::floor((u_end - u_start) / u_inc) + 1;
+    int num_v = std::floor((v_end - v_start) / v_inc) + 1;
+
+    crg_file << std::fixed << std::setprecision(6);
+    crg_file << "* OpenCRG Curvilinear Elevation Grid (NURBS/Bezier Fit)\n";
+    crg_file << "$CT 1.2\n";
+    crg_file << "$UB " << u_start << "\n$UE " << u_start + (num_u - 1) * u_inc << "\n$UI " << u_inc << "\n";
+    crg_file << "$VB " << v_start << "\n$VE " << v_start + (num_v - 1) * v_inc << "\n$VI " << v_inc << "\n";
+
+    crg_file << "* Reference Line X Coordinates\n$X " << num_u << "\n";
+    for (int u_idx = 0; u_idx < num_u; ++u_idx) {
+        double t = arc_param.getTimeAtArcLength(u_start + u_idx * u_inc); 
+        crg_file << trajectory.getPoseAtTime(t)(0, 3) << " ";
+    }
+    crg_file << "\n";
+
+    crg_file << "* Reference Line Y Coordinates\n$Y " << num_u << "\n";
+    for (int u_idx = 0; u_idx < num_u; ++u_idx) {
+        double t = arc_param.getTimeAtArcLength(u_start + u_idx * u_inc);
+        crg_file << trajectory.getPoseAtTime(t)(1, 3) << " ";
+    }
+    crg_file << "\n";
+
+    crg_file << "* Reference Line Heading (PHI)\n$PHI " << num_u << "\n";
+    for (int u_idx = 0; u_idx < num_u; ++u_idx) {
+        double t = arc_param.getTimeAtArcLength(u_start + u_idx * u_inc);
+        Eigen::Matrix4d pose = trajectory.getPoseAtTime(t);
+        crg_file << std::atan2(pose(1, 0), pose(0, 0)) << " ";
+    }
+    crg_file << "\n";
+
+    crg_file << "* Elevation Data Block\n";
+    for (int u_idx = 0; u_idx < num_u; ++u_idx) {
+        double current_u = u_start + u_idx * u_inc;
+        double u_norm = (current_u - fitter.config.u_min) / fitter.config.element_size_u;
+        int elem_u = std::clamp(static_cast<int>(std::floor(u_norm)), 0, fitter.config.num_elements_u - 1);
+        double xi = u_norm - elem_u;
+
+        for (int v_idx = 0; v_idx < num_v; ++v_idx) {
+            double current_v = v_start + v_idx * v_inc;
+            double v_norm = (current_v - fitter.config.v_min) / fitter.config.element_size_v;
+            int elem_v = std::clamp(static_cast<int>(std::floor(v_norm)), 0, fitter.config.num_elements_v - 1);
+            double eta = v_norm - elem_v;
+
+            // Bridge to your custom header!
+            std::vector<float> local_weights = fitter.extractLocalWeights(elem_u, elem_v);
+            Bezier::WeightDependentCache<2, 3> w_cache(local_weights);
+            Bezier::BezierFunctionEvaluator<2, 3> evaluator(w_cache);
+            
+            auto result = evaluator.evaluate(xi, eta);
+            
+            // To get purely the continuous Z height, sum the weighted basis values.
+            // Since we set weights as Z, the output 'R' at idx 0 for each CP needs to be summed
+            double z_val = 0.0;
+            for(int cpt = 0; cpt < 16; ++cpt) {
+                // Notice: In a non-rational fit where we embedded Z into the weight cache, 
+                // evaluate() returns the basis function R. We multiply it by the Z "weight".
+                z_val += result[cpt][0] * local_weights[cpt]; 
+            }
+            
+            crg_file << z_val << " ";
+        }
+        crg_file << "\n"; 
+    }
+
+    crg_file.close();
+    std::cout << "Successfully exported perfectly continuous OpenCRG to " << filename << std::endl;
+    return true;
+}
+
+// ====================================================================
+// B-SPLINE TO 3D GRID
+// ====================================================================
+std::vector<std::vector<Eigen::Vector3d>> generateBezierGrid3D(
+    const BSplineSurfaceFitter& fitter,
+    const TrajectoryInterpolator& trajectory,
+    const ArcLengthParameterization& arc_param,
+    double u_inc = 0.5, double v_inc = 0.5) // Default to 0.5m for a lighter 3D mesh
+{
+    std::cout << "\n--- Generating 3D Mesh Vertices from B-Spline ---" << std::endl;
+    double u_start = fitter.config.u_min;
+    double u_end   = fitter.config.u_max;
+    double v_start = fitter.config.v_min;
+    double v_end   = fitter.config.v_max;
+
+    int num_u = std::floor((u_end - u_start) / u_inc) + 1;
+    int num_v = std::floor((v_end - v_start) / v_inc) + 1;
+
+    std::vector<std::vector<Eigen::Vector3d>> grid_3d(num_u, std::vector<Eigen::Vector3d>(num_v));
+
+    for (int u_idx = 0; u_idx < num_u; ++u_idx) {
+        double current_u = u_start + u_idx * u_inc;
+        double u_norm = (current_u - fitter.config.u_min) / fitter.config.element_size_u;
+        int elem_u = std::clamp(static_cast<int>(std::floor(u_norm)), 0, fitter.config.num_elements_u - 1);
+        double xi = u_norm - elem_u;
+
+        // Get the vehicle's pose at this distance down the road
+        double t = arc_param.getTimeAtArcLength(current_u);
+        Eigen::Matrix4d T_spine = trajectory.getPoseAtTime(t);
+
+        for (int v_idx = 0; v_idx < num_v; ++v_idx) {
+            double current_v = v_start + v_idx * v_inc;
+            double v_norm = (current_v - fitter.config.v_min) / fitter.config.element_size_v;
+            int elem_v = std::clamp(static_cast<int>(std::floor(v_norm)), 0, fitter.config.num_elements_v - 1);
+            double eta = v_norm - elem_v;
+
+            // Evaluate the Z height using your header!
+            std::vector<float> local_weights = fitter.extractLocalWeights(elem_u, elem_v);
+            Bezier::WeightDependentCache<2, 3> w_cache(local_weights);
+            Bezier::BezierFunctionEvaluator<2, 3> evaluator(w_cache);
+            
+            auto result = evaluator.evaluate(xi, eta);
+            double z_val = 0.0;
+            for(int cpt = 0; cpt < 16; ++cpt) {
+                z_val += result[cpt][0] * local_weights[cpt]; 
+            }
+
+            // Project the local (v, z) coordinate back into the Global ENU frame
+            Eigen::Vector4d p_local(0.0, current_v, z_val, 1.0);
+            Eigen::Vector4d p_global = T_spine * p_local;
+
+            grid_3d[u_idx][v_idx] = p_global.head<3>();
+        }
+    }
+    return grid_3d;
 }
 
 // ====================================================================
@@ -900,7 +1273,7 @@ int main() {
 
     // --- STAGE 2: PCAP PARSING ---
     auto t_pcap_start = std::chrono::high_resolution_clock::now();
-    if (!parseOusterPcap(pcap_file, json_file, trajectory, raw_cloud, point_times, 5000)) {
+    if (!parseOusterPcap(pcap_file, json_file, trajectory, raw_cloud, point_times, 500)) {
         return -1;
     }
     auto t_pcap_end = std::chrono::high_resolution_clock::now();
@@ -909,10 +1282,20 @@ int main() {
     // --- STAGE 3: DESKEWING ---
     std::cout << "Deskewing using " << omp_get_max_threads() << " CPU threads..." << std::endl;
     auto t_deskew_start = std::chrono::high_resolution_clock::now();
-    
-    auto deskewed_cloud = deskewPointCloudParallel(raw_cloud, point_times, trajectory);
+
+    // 1. Deskew in place
+    deskewPointCloudParallel(raw_cloud, point_times, trajectory);
+
+    // 2. Save the boundary times BEFORE we destroy the vector
+    double first_point_time = point_times.front();
+    double last_point_time = point_times.back();
+
+    // 3. Aggressively free memory!
+    point_times.clear();
+    point_times.shrink_to_fit();
     
     auto t_deskew_end = std::chrono::high_resolution_clock::now();
+
     std::chrono::duration<double> duration_deskew = t_deskew_end - t_deskew_start;
 
     // --- STAGE 4: GROUND EXTRACTION (CSF) ---
@@ -923,7 +1306,7 @@ int main() {
         open3d::io::ReadPointCloud(cache_file, *cloth_cloud);
     } else {
         std::cout << "-- No cache found. Running Cloth Simulation Filter..." << std::endl;
-        cloth_cloud = extractBareEarthCSF(deskewed_cloud); 
+        cloth_cloud = extractBareEarthCSF(raw_cloud); 
         std::cout << "-- Saving ground points to cache..." << std::endl;
         open3d::io::WritePointCloud(cache_file, *cloth_cloud);
     }
@@ -934,37 +1317,73 @@ int main() {
     std::cout << "Surface Generation" << std::endl;
     auto t_surface_start = std::chrono::high_resolution_clock::now();
     if (cloth_cloud && !cloth_cloud->points_.empty()) {
-        ArcLengthParameterization arc_param(trajectory, point_times.front(), point_times.back());
+        ArcLengthParameterization arc_param(trajectory, first_point_time, last_point_time);
         double true_driven_distance = arc_param.getTotalLength();
 
-        double u_start = 0.0;
-        double u_end   = true_driven_distance; 
+        double max_road_width = 10.0;
         
-        double v_start = -15.0; 
-        double v_end   =  15.0; 
-        
-        double u_inc = 0.5; 
-        double v_inc = 0.5; 
+        // 1. Map to Curvilinear
+        std::vector<PointUVZ> uvz_data = mapToCurvilinearSpace(cloth_cloud, trajectory, arc_param, max_road_width);
 
-        std::cout << "Curvilinear Grid Size Detected:" << std::endl;
-        std::cout << "  U Domain (Forward): [" << u_start << " to " << u_end << "] meters" << std::endl;
-        std::cout << "  V Domain (Lateral): [" << v_start << " to " << v_end << "] meters" << std::endl;
+        // 2. Global B-Spline Fit (e.g., 5-meter longitudinal, 1-meter lateral elements)
+        BSplineSurfaceFitter fitter(0.0, true_driven_distance, -max_road_width, max_road_width, 5.0, 1.0);
+        if (fitter.fitSurface(uvz_data)) {
+            
+            // 3. Export High-Res OpenCRG (e.g., 10cm grid)
+            exportToOpenCRG_Bezier(crg_file, fitter, trajectory, arc_param, 0.1, 0.1);
 
-        std::vector<double> grid_u, grid_v;
-        for (double u = u_start; u <= u_end; u += u_inc) grid_u.push_back(u);
-        for (double v = v_start; v <= v_end; v += v_inc) grid_v.push_back(v);
-
-        auto grid_3d = generateCurvilinearGridIDW(cloth_cloud, grid_u, grid_v, trajectory, arc_param, 3.0);
-
-        std::cout << "-- Generating OpenCRG" << std::endl;
-        exportToOpenCRG_Curved(crg_file, grid_3d, trajectory, arc_param, u_start, u_inc, v_start, v_inc);
-        
-        std::cout << "-- Generating OBJ" << std::endl;
-        exportToOBJ(obj_file, grid_3d);
+            // 4. Generate 3D Grid and Export OBJ for Visualizer (e.g., 50cm grid)
+            // We use a slightly larger increment here so the OBJ isn't a massive 2GB file!
+            auto grid_3d = generateBezierGrid3D(fitter, trajectory, arc_param, 0.5, 0.5);
+            exportToOBJ(obj_file, grid_3d);
+        }
 
     } else {
-        std::cerr << "-- Pipeline Error: No ground points available for CRG/OBJ generation." << std::endl;
+        std::cerr << "-- Pipeline Error: No ground points available for CRG generation." << std::endl;
     }
+
+    // // --- STAGE 5: SURFACE GENERATION ---
+    // std::cout << "Surface Generation" << std::endl;
+    // auto t_surface_start = std::chrono::high_resolution_clock::now();
+    // if (cloth_cloud && !cloth_cloud->points_.empty()) {
+    //     ArcLengthParameterization arc_param(trajectory, first_point_time, last_point_time);
+    //     double true_driven_distance = arc_param.getTotalLength();
+
+    //     // --- NEW: Map to Curvilinear Space ---
+    //     double max_road_width = 10.0; // Keep points within 10m left/right of the car
+    //     std::vector<PointUVZ> uvz_data = mapToCurvilinearSpace(cloth_cloud, trajectory, arc_param, max_road_width);
+
+    //     // [We will drop the BSplineSurfaceFitter here next!]
+
+    //     // --- OLD IDW Grid (Temporary fallback) ---
+    //     double u_start = 0.0;
+    //     double u_end   = true_driven_distance; 
+        
+    //     double v_start = -10.0; 
+    //     double v_end   =  10.0; 
+        
+    //     double u_inc = 0.1; 
+    //     double v_inc = 0.1;
+
+    //     std::cout << "Curvilinear Grid Size Detected:" << std::endl;
+    //     std::cout << "  U Domain (Forward): [" << u_start << " to " << u_end << "] meters" << std::endl;
+    //     std::cout << "  V Domain (Lateral): [" << v_start << " to " << v_end << "] meters" << std::endl;
+
+    //     std::vector<double> grid_u, grid_v;
+    //     for (double u = u_start; u <= u_end; u += u_inc) grid_u.push_back(u);
+    //     for (double v = v_start; v <= v_end; v += v_inc) grid_v.push_back(v);
+
+    //     auto grid_3d = generateCurvilinearGridIDW(cloth_cloud, grid_u, grid_v, trajectory, arc_param, 3.0);
+
+    //     std::cout << "-- Generating OpenCRG" << std::endl;
+    //     exportToOpenCRG_Curved(crg_file, grid_3d, trajectory, arc_param, u_start, u_inc, v_start, v_inc);
+        
+    //     std::cout << "-- Generating OBJ" << std::endl;
+    //     exportToOBJ(obj_file, grid_3d);
+
+    // } else {
+    //     std::cerr << "-- Pipeline Error: No ground points available for CRG/OBJ generation." << std::endl;
+    // }
     auto t_surface_end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration_surface = t_surface_end - t_surface_start;
     
@@ -999,12 +1418,12 @@ int main() {
         cloth_cloud->PaintUniformColor({0.0, 1.0, 0.0});
         cloth_cloud->Translate(Eigen::Vector3d(0.0, 0.0, -1));
 
-        deskewed_cloud->PaintUniformColor({0.5, 0.5, 0.5});
+        raw_cloud->PaintUniformColor({0.5, 0.5, 0.5});
 
         std::cout << "Opening 3D Visualizer..." << std::endl;
         
         open3d::visualization::DrawGeometries(
-            {cloth_cloud, deskewed_cloud, terrain_mesh},
+            {cloth_cloud, raw_cloud, terrain_mesh},
             "OpenCRG Terrain Mesh with LiDAR Overlay"
         );
     } else {
